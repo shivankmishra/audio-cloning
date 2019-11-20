@@ -1,0 +1,143 @@
+import matplotlib
+matplotlib.use('agg')
+import matplotlib.pyplot as plt
+from torch.autograd import Variable
+from utils import *
+from model import *
+import time
+import math
+import sys
+cuda = True if torch.cuda.is_available() else False
+
+from wavernn_audio import melspectrogram
+
+def run_transfer(content_path, style_path, output_path, gram_mode, tv_coef):
+    content_wav, sr = librosa.load(content_path)
+    style_wav, sr = librosa.load(style_path)
+
+    if len(content_wav) > len(style_wav):
+        style_wav = np.append(style_wav, np.zeros(len(content_wav) - len(style_wav)))
+    else:
+        content_wav = np.append(content_wav, np.zeros(len(style_wav) - len(content_wav)))
+
+    a_content = melspectrogram(content_wav)
+    a_style = melspectrogram(style_wav)
+
+    print(a_content.shape)
+    print(a_style.shape)
+
+    N_SAMPLES = max(a_content.shape[1], a_style.shape[1])
+
+    print(N_SAMPLES)
+    print(N_CHANNELS)
+
+    plt.imsave('content_spectrum.png', a_content[:, :])
+    plt.imsave('style_spectrum.png', a_style[:, :])
+
+
+    a_content_torch = torch.from_numpy(a_content)[None, None, :, :]
+    if cuda:
+        a_content_torch = a_content_torch.cuda()
+    print(a_content_torch.shape)
+    a_style_torch = torch.from_numpy(a_style)[None, None, :, :]
+    if cuda:
+        a_style_torch = a_style_torch.cuda()
+    print(a_style_torch.shape)
+
+    model = RandomCNN()
+    model.eval()
+
+    a_C_var = Variable(a_content_torch, requires_grad=False).float()
+    a_S_var = Variable(a_style_torch, requires_grad=False).float()
+    if cuda:
+        model = model.cuda()
+        a_C_var = a_C_var.cuda()
+        a_S_var = a_S_var.cuda()
+
+    a_C = model(a_C_var)
+    a_S = model(a_S_var)
+    print(a_C.shape)
+
+    # Optimizer
+    learning_rate = 0.002
+    a_G_var = Variable(torch.randn(a_content_torch.shape).cuda() * 1e-3, requires_grad=True)
+    optimizer = torch.optim.Adam([a_G_var])
+
+    # coefficient of content and style
+    style_param = 10
+    content_param = 1e2
+    tv_param = 4e-6
+
+    num_epochs = 10000
+    print_every = 1000
+    plot_every = 1000
+
+    # Keep track of losses for plotting
+    current_loss = 0
+    all_losses = []
+
+
+    def timeSince(since):
+        now = time.time()
+        s = now - since
+        m = math.floor(s / 60)
+        s -= m * 60
+        return '%dm %ds' % (m, s)
+
+
+    start = time.time()
+    # Train the Model
+    for epoch in range(1, num_epochs + 1):
+        optimizer.zero_grad()
+        a_G = model(a_G_var)
+
+        content_loss = content_param * compute_content_loss(a_C, a_G, gram_mode)
+        style_loss = style_param * compute_layer_style_loss(a_S, a_G, gram_mode)
+        if tv_coef > 0:
+            tv_loss = tv_coef * (
+                torch.sum(torch.abs(a_G[:, :, :, :-1] - a_G[:, :, :, 1:])) + 
+                torch.sum(torch.abs(a_G[:, :, :-1, :] - a_G[:, :, 1:, :]))
+            )
+            loss = content_loss + style_loss + tv_loss
+        else:
+            loss = content_loss + style_loss
+        loss.backward()
+        optimizer.step()
+
+        # print
+        if epoch % print_every == 0:
+            print("{} {}% {} content_loss:{:4f} style_loss:{:4f} total_loss:{:4f}".format(epoch,
+                                                                                          epoch / num_epochs * 100,
+                                                                                          timeSince(start),
+                                                                                          content_loss.data[0],
+                                                                                          style_loss.data[0],
+                                                                                          loss.data[0]))
+            current_loss += loss.data[0]
+
+        # Add current loss avg to list of losses
+        if epoch % plot_every == 0:
+            all_losses.append(current_loss / plot_every)
+            current_loss = 0
+
+    gen_spectrum = a_G_var.cpu().data.numpy().squeeze()
+
+    print(gen_spectrum.shape)
+    np.save(output_path, gen_spectrum)
+
+    plt.figure()
+    plt.plot(all_losses)
+    plt.savefig('loss_curve.png')
+    plt.imsave('gen_spectrum.png', gen_spectrum[:, :])
+    
+if __name__ == '__main__':
+    # Usage: python train.py content style output gram_mode tv_coef
+    if len(sys.argv) != 6:
+        print('Usage: python train.py content style output gram_mode tv_coef')
+        sys.exit(1)
+    print(sys.argv)
+    content_path = sys.argv[1]
+    style_path = sys.argv[2]
+    output_path = sys.argv[3]
+    gram_mode = sys.argv[4]
+    tv_coef = sys.argv[5]
+    run_transfer(content_path, style_path, output_path, gram_mode, tv_coef)
